@@ -1,0 +1,116 @@
+
+name: Infrastructure CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  infrastructure-check:
+    name: Validate infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare CI environment
+        shell: pwsh
+        run: |
+          $lines = @(
+              "POSTGRES_USER=memory_admin"
+              "POSTGRES_PASSWORD=ci_admin_password"
+              "POSTGRES_PORT=5432"
+              "QDRANT_HTTP_PORT=6333"
+              "QDRANT_GRPC_PORT=6334"
+              "KAFKA_EXTERNAL_PORT=9092"
+          )
+
+          $keys = @(
+              "USER_PROJECT_DB_PASSWORD"
+              "EMBEDDING_DB_PASSWORD"
+              "ANONYMIZATION_DB_PASSWORD"
+              "CONVERSATION_MEMORY_DB_PASSWORD"
+              "SEARCH_WARMUP_DB_PASSWORD"
+              "PLATFORM_DB_PASSWORD"
+          )
+
+          foreach ($key in $keys) {
+              $bytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
+              $password = [Convert]::ToHexString($bytes).ToLower()
+              $lines += "$key=$password"
+          }
+
+          Set-Content -Path .env -Value $lines -Encoding utf8
+
+      - name: Validate Docker Compose
+        run: docker compose config -q
+
+      - name: Check required files
+        shell: pwsh
+        run: |
+          $files = @(
+              "docker-compose.yml"
+              ".env.example"
+              "infrastructure/postgres/init/01-create-databases.sql"
+              "infrastructure/postgres/scripts/02-create-service-roles.sql"
+              "scripts/setup-postgres.ps1"
+          )
+
+          foreach ($file in $files) {
+              if (-not (Test-Path $file)) {
+                  throw "Required file not found: $file"
+              }
+
+              Write-Host "OK: $file"
+          }
+
+      - name: Start infrastructure
+        run: docker compose up -d --wait --wait-timeout 180
+
+      - name: Configure PostgreSQL
+        shell: pwsh
+        run: ./scripts/setup-postgres.ps1
+
+      - name: Verify PostgreSQL databases
+        shell: pwsh
+        run: |
+          $query = "SELECT count(*) FROM pg_database WHERE datname IN ('user_project_db','embedding_db','anonymization_db','conversation_memory_db','search_warmup_db','platform_db');"
+
+          $result = docker exec ai-memory-postgres psql -U memory_admin -d postgres -t -A -c $query
+
+          if ($LASTEXITCODE -ne 0 -or $result.Trim() -ne "6") {
+              throw "Expected six service databases, found: $result"
+          }
+
+          Write-Host "OK: all six service databases exist."
+
+      - name: Verify service roles
+        shell: pwsh
+        run: |
+          $query = "SELECT count(*) FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND rolname IN ('user_project_app','embedding_app','anonymization_app','conversation_memory_app','search_warmup_app','platform_app');"
+
+          $result = docker exec ai-memory-postgres psql -U memory_admin -d postgres -t -A -c $query
+
+          if ($LASTEXITCODE -ne 0 -or $result.Trim() -ne "6") {
+              throw "Expected six restricted service roles, found: $result"
+          }
+
+          Write-Host "OK: all six service roles are configured."
+
+      - name: Stop infrastructure
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+      - name: Remove CI environment
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path .env) {
+              Remove-Item .env -Force
+          }
